@@ -18,7 +18,7 @@ Cisco、Yamaha、Fortinet、A10、HPE Comwareの対応コマンドについて�
 | CiscoのVRF別経路表示 | `list[RoutingTable]` | 各テーブルの`.vrf`、`.routes` |
 | Interface表示 | `list[Interface]` | `.name`、`.ipv4_address`、`.operational_status`など |
 | VLAN表示 | `list[VLAN]` | `.vlan_id`、`.name`など |
-| 設定表示 | `ConfigDocument` | `.interfaces`、`.static_routes`、`.vrfs`など |
+| 設定表示 | `ConfigDocument` | `.interfaces`、`.static_routes`、`.vrfs`、`.acls`、`.acl_bindings`など |
 
 設定のInterfaceアドレスは`ipv4_addresses`で保持します。運用コマンドでは出力形式に応じて`ipv4_address`または`ipv4_addresses`を使用します。取得できる項目はコマンドごとに異なります。
 
@@ -108,7 +108,7 @@ if isinstance(result.data, ConfigDocument):
 | A10 / ACOS | `show ip route`、`show interfaces` | `show running-config` |
 | HPE / Comware | `display ip routing-table`、`display ip routing-table vpn-instance <名前>`、`display interface` | `display current-configuration` |
 
-コマンドが登録されていても、その全構文・全出力形式に対応するわけではありません。詳細は[設定パーサの対応表](docs/vendor-config-support.md)、[サポート状況](docs/support-status.md)、[VRF対応表](docs/vrf-support.md)を参照してください。詳細の調査記録には英語の文書もあります。
+コマンドが登録されていても、その全構文・全出力形式に対応するわけではありません。IPv4 ACLはCisco IOS/IOS XEと、公式構文を確認したYamaha RTX静的フィルターの一部を解析します。パケット評価は行わず、未対応のルールはACLを不完全として保持します。詳細は[ACL対応表](docs/acl-support.md)、[設定パーサの対応表](docs/vendor-config-support.md)、[サポート状況](docs/support-status.md)、[VRF対応表](docs/vrf-support.md)を参照してください。詳細の調査記録には英語の文書もあります。
 
 Cisco NX-OS、ArubaOS-CX、ArubaOS-Switchのパーサは未登録です。IPv6とLLDPは対象外です。機器接続やコマンド実行は行わず、取得済みのテキストを入力にします。
 

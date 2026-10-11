@@ -228,11 +228,58 @@ class BGPPeer:
 
 
 @dataclass(slots=True)
+class ACLAddressCondition:
+    kind: str
+    address: IPv4Address | IPv4Network | None = None
+    wildcard_mask: IPv4Address | None = None
+
+
+@dataclass(slots=True)
+class ACLPortCondition:
+    operator: str
+    first_port: int
+    last_port: int | None = None
+
+
+@dataclass(slots=True)
+class ACLRule:
+    input_order: int
+    sequence: int | None = None
+    action: str | None = None
+    protocol: str | None = None
+    source: ACLAddressCondition | None = None
+    destination: ACLAddressCondition | None = None
+    source_port: ACLPortCondition | None = None
+    destination_port: ACLPortCondition | None = None
+    remark: str | None = None
+    log: bool | None = None
+    source_reference: SourceReference | None = None
+    complete: bool = True
+    incomplete_reasons: list[str] = field(default_factory=list)
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ACLBinding:
+    acl_name: str
+    target_type: str
+    target_name: str
+    direction: str | None = None
+    source_reference: SourceReference | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class ACL:
     name: str
     type: str | None = None
     entries: list[str] = field(default_factory=list)
     attributes: dict[str, Any] = field(default_factory=dict)
+    rules: list[ACLRule] = field(default_factory=list)
+    source_reference: SourceReference | None = None
+    complete: bool = True
+    incomplete_reasons: list[str] = field(default_factory=list)
+    incomplete_source_references: list[SourceReference] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -284,6 +331,7 @@ class RouteMapEntry:
     prefix_list_references: tuple[str, ...] = ()
     acl_references: tuple[str, ...] = ()
     source_reference: SourceReference | None = None
+    acl_reference_sources: tuple[SourceReference, ...] = ()
 
 
 @dataclass(slots=True)
@@ -384,6 +432,8 @@ class ConfigReference:
     line_number: int | None = None
     resolved: bool | None = None
     source_sequence: int | None = None
+    resolution_reason: str | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -425,3 +475,5 @@ class ConfigDocument:
     unsupported_lines: list[UnsupportedConfigLine] = field(default_factory=list)
     banners: list[Banner] = field(default_factory=list)
     references: list[ConfigReference] = field(default_factory=list)
+    acls: list[ACL] = field(default_factory=list)
+    acl_bindings: list[ACLBinding] = field(default_factory=list)

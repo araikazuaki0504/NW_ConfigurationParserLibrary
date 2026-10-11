@@ -83,3 +83,40 @@ if isinstance(result.data, ConfigDocument):
 ここでの`result`は、READMEの設定解析例などで取得した結果です。運用コマンドのInterface一覧は`list[Interface]`なので、そのリストから検索します。設定全体の`raw_text`やノードは入力本文を保持するため、共有用の表示には必要な設定項目だけを選んでください。
 
 共通モデルの定義は`src/nwconfig_parser/models.py`、コマンドごとの対応範囲は[サポート状況](support-status.md)を参照してください。
+
+## ACLの内容と適用先を確認する
+
+Cisco IOS/IOS XEのIPv4 ACLとYamaha RTX静的フィルターは`ConfigDocument.acls`に、適用先は`acl_bindings`に保持されます。ACL参照は`references`で確認できます。下記のfixtureは手書きの合成データです。
+
+```python
+from pathlib import Path
+
+from nwconfig_parser.cli import build_registry
+from nwconfig_parser.core.engine import ParserEngine
+from nwconfig_parser.models import ConfigDocument
+from nwconfig_parser.parsers.base import ParseContext
+
+path = Path("tests/config/cisco_acl_synthetic.cfg")
+result = ParserEngine(build_registry()).parse(
+    path.read_text(encoding="utf-8"),
+    ParseContext(
+        vendor="Cisco",
+        os_family="IOS XE",
+        command="running-config",
+        filename=str(path),
+    ),
+)
+
+if isinstance(result.data, ConfigDocument):
+    for acl in result.data.acls:
+        print(acl.name, acl.type, acl.complete)
+        for rule in acl.rules:
+            print(rule.sequence, rule.action, rule.protocol, rule.source)
+    for binding in result.data.acl_bindings:
+        print(binding.target_type, binding.target_name, binding.direction)
+    for reference in result.data.references:
+        if reference.target_type == "acl":
+            print(reference.target_name, reference.resolved, reference.resolution_reason)
+```
+
+`resolved=True`はACL定義の存在を確認したことだけを意味し、ルール完全性や通信の許可を保証しません。`resolved=None`は同名の異なるACL種別などにより曖昧な場合です。アドレス条件とポート条件は内容を表示するため、共有ログ等へ出力する際は利用者側で機密性を確認してください。未対応ルール、パケット評価、設定投入は対象外です。詳細は[ACL対応表](acl-support.md)を参照してください。

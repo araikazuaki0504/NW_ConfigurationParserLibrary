@@ -9,10 +9,22 @@ are interpreted. ``pp select``/``tunnel select`` set a statement-order context
 from __future__ import annotations
 
 import re
-from ipaddress import IPv4Network
+from ipaddress import IPv4Address, IPv4Network
 from typing import Any
 
-from nwconfig_parser.models import ConfigNode, Route
+from nwconfig_parser.models import (
+    ACL,
+    ACLAddressCondition,
+    ACLBinding,
+    ACLPortCondition,
+    ACLRule,
+    ConfigDocument,
+    ConfigNode,
+    ConfigReference,
+    IssueSeverity,
+    ParseIssue,
+    Route,
+)
 from nwconfig_parser.parsers.vendor_config_base import (
     ConfigInterpreter,
     Reject,
@@ -32,6 +44,13 @@ class YamahaRtxConfigInterpreter(ConfigInterpreter):
     # (kind, number) chosen by the latest `pp select` / `tunnel select`.
     _context: tuple[str, str] | None = None
 
+    def __init__(
+        self, document: ConfigDocument, filename: str | None, command: str
+    ) -> None:
+        super().__init__(document, filename, command)
+        self._acls: dict[str, ACL] = {}
+        self._bindings: list[ACLBinding] = []
+
     def handle_root(self, node: ConfigNode) -> None:
         tokens = node.command.split()
         negated = node.negated
@@ -44,6 +63,15 @@ class YamahaRtxConfigInterpreter(ConfigInterpreter):
             self._description(node)
         elif keyword == "ip" and len(tokens) >= 2 and tokens[1].casefold() == "route":
             self._route(node, tokens[2:], negated)
+        elif keyword == "ip" and len(tokens) >= 2 and tokens[1].casefold() == "filter":
+            self._ip_filter(node, tokens[2:], negated)
+        elif (
+            keyword == "ip"
+            and len(tokens) >= 4
+            and tokens[2].casefold() == "secure"
+            and tokens[3].casefold() == "filter"
+        ):
+            self._secure_filter(node, tokens[1], tokens[4:], negated)
         elif keyword == "ip" and len(tokens) >= 3 and tokens[2].casefold() == "address":
             self._address(node, tokens[1], tokens[3:], negated)
         elif keyword == "lan" and len(tokens) >= 3 and tokens[1] == "shutdown":
@@ -52,6 +80,263 @@ class YamahaRtxConfigInterpreter(ConfigInterpreter):
             raise Reject("snmp sysname is not a hostname command; not mapped.")
         else:
             raise Reject("Statement is not supported by this parser.")
+
+    def finalize(self) -> None:
+        super().finalize()
+        self.document.acls = list(self._acls.values())
+        self.document.acl_bindings = self._bindings
+        defined = {name.casefold() for name in self._acls}
+        references: list[ConfigReference] = []
+        for binding in self._bindings:
+            source = binding.source_reference
+            resolved = binding.acl_name.casefold() in defined
+            references.append(
+                ConfigReference(
+                    source_type=binding.target_type,
+                    source_name=binding.target_name,
+                    relation=f"secure-filter-{binding.direction}",
+                    target_type="acl",
+                    target_name=binding.acl_name,
+                    line_number=source.start_line if source else None,
+                    resolved=resolved,
+                )
+            )
+            if not resolved:
+                self.issues.append(
+                    ParseIssue(
+                        severity=IssueSeverity.INFO,
+                        code="DANGLING_REFERENCE",
+                        message="Filter reference is not defined in the parsed input.",
+                        line_number=source.start_line if source else None,
+                        source_reference=source,
+                    )
+                )
+        self.document.references = references
+
+    def _ip_filter(
+        self, node: ConfigNode, tokens: list[str], negated: bool
+    ) -> None:
+        if not tokens or not tokens[0].isdigit():
+            raise Reject("Static filter number is missing or invalid.", invalid=True)
+        filter_id = int(tokens[0])
+        if not 1 <= filter_id <= 21474836:
+            raise Reject(
+                "Static filter number is outside the documented range.", invalid=True
+            )
+        name = str(filter_id)
+        if negated:
+            if len(tokens) > 2 or (
+                len(tokens) == 2 and tokens[1].casefold() not in {"pass", "reject"}
+            ):
+                acl = self._acls.get(name)
+                if acl is not None:
+                    self._taint_acl(acl, node, "unsupported removal form")
+                raise Reject("Static-filter removal form is not supported.")
+            acl = self._acls.get(name)
+            action_matches = (
+                len(tokens) == 1
+                or (
+                    acl is not None
+                    and str(acl.rules[0].attributes.get("vendor_action", "")).startswith(
+                        tokens[1].casefold()
+                    )
+                )
+            )
+            if acl is not None and action_matches:
+                self._acls.pop(name)
+            elif acl is not None:
+                self.info(
+                    node,
+                    "FILTER_ACTION_MISMATCH",
+                    "The filter action does not match the parsed definition.",
+                )
+            else:
+                self._missing(node)
+            self.parsed(node)
+            return
+        if len(tokens) < 3:
+            acl = self._acls.get(name)
+            if acl is not None:
+                self._taint_acl(acl, node, "invalid redefinition")
+            raise Reject("Static filter requires an action and source.", invalid=True)
+        if name in self._acls:
+            self._taint_acl(self._acls[name], node, "duplicate filter identifier")
+            raise Reject("Duplicate static-filter identifier; no overwrite is assumed.")
+        action_token = tokens[1].casefold()
+        actions = {
+            "pass": ("permit", None),
+            "pass-log": ("permit", True),
+            "pass-nolog": ("permit", False),
+            "reject": ("deny", None),
+            "reject-log": ("deny", True),
+            "reject-nolog": ("deny", False),
+        }
+        action = actions.get(action_token)
+        if action is None:
+            raise Reject("Conditional or unsupported filter action.")
+
+        values = tokens[2:]
+        source, index = self._filter_address(values, 0)
+        destination = ACLAddressCondition(kind="any")
+        if index < len(values):
+            destination, index = self._filter_address(values, index)
+        protocol = "ip"
+        if index < len(values):
+            protocol = values[index].casefold()
+            index += 1
+            if protocol == "*":
+                protocol = "ip"
+            elif protocol not in {"tcp", "udp", "icmp", "gre", "esp", "ah"}:
+                raise Reject("Filter protocol is not supported by this IPv4 parser.")
+        source_port: ACLPortCondition | None = None
+        destination_port: ACLPortCondition | None = None
+        if index < len(values):
+            if protocol not in {"tcp", "udp"}:
+                raise Reject("Only TCP/UDP numeric ports are modelled.")
+            source_port, index = self._filter_port(values, index)
+        if index < len(values):
+            if protocol not in {"tcp", "udp"}:
+                raise Reject("Only TCP/UDP numeric ports are modelled.")
+            destination_port, index = self._filter_port(values, index)
+        if index != len(values):
+            raise Reject("Filter options are not supported.")
+
+        reference = self.reference(node.line_number)
+        rule = ACLRule(
+            input_order=0,
+            sequence=filter_id,
+            action=action[0],
+            protocol=protocol,
+            source=source,
+            destination=destination,
+            source_port=source_port,
+            destination_port=destination_port,
+            log=action[1],
+            source_reference=reference,
+            attributes={"vendor_action": action_token},
+        )
+        self._acls[name] = ACL(
+            name=name,
+            type="ip-filter",
+            entries=[node.command],
+            attributes={
+                "vendor": "Yamaha",
+                "os_family": "RTX",
+                "acl_scope": "global",
+            },
+            rules=[rule],
+            source_reference=reference,
+        )
+        self.parsed(node)
+
+    @staticmethod
+    def _filter_address(
+        tokens: list[str], index: int
+    ) -> tuple[ACLAddressCondition, int]:
+        if index >= len(tokens):
+            raise Reject("Filter address condition is missing.", invalid=True)
+        value = tokens[index]
+        if value == "*":
+            return ACLAddressCondition(kind="any"), index + 1
+        if "," in value or "*" in value or "-" in value or "@" in value:
+            raise Reject("Address lists and non-literal addresses are not modelled.")
+        address_text, separator, mask_text = value.partition("/")
+        try:
+            address = IPv4Address(address_text)
+        except ValueError as exc:
+            raise Reject("Filter IPv4 address is invalid.", invalid=True) from exc
+        if not separator:
+            return ACLAddressCondition(kind="host", address=address), index + 1
+        prefix = mask_to_prefix(mask_text, allow_hex=True)
+        network = make_network(str(address), prefix)
+        return ACLAddressCondition(kind="prefix", address=network), index + 1
+
+    @staticmethod
+    def _filter_port(
+        tokens: list[str], index: int
+    ) -> tuple[ACLPortCondition | None, int]:
+        value = tokens[index]
+        if value == "*":
+            return None, index + 1
+        if not value.isdigit():
+            raise Reject("Only a single numeric port is supported.")
+        port = int(value)
+        if not 0 <= port <= 65535:
+            raise Reject("Filter port is outside the numeric range.", invalid=True)
+        return ACLPortCondition(operator="eq", first_port=port), index + 1
+
+    def _secure_filter(
+        self,
+        node: ConfigNode,
+        target_token: str,
+        tokens: list[str],
+        negated: bool,
+    ) -> None:
+        if not tokens or tokens[0].casefold() not in {"in", "out"}:
+            raise Reject("Secure-filter direction must be in or out.", invalid=True)
+        direction = tokens[0].casefold()
+        if target_token.casefold() == "null":
+            if direction == "in":
+                raise Reject("The documented NULL interface has no inbound filter.")
+            name = "null"
+            target_type = "interface"
+        else:
+            name = self._name(target_token)
+            target_type = (
+                "interface"
+                if _INTERFACE.fullmatch(target_token) is not None
+                else target_token.casefold()
+            )
+        if target_type == "interface":
+            self.interface(name)
+        filter_ids = tokens[1:]
+        if any(not token.isdigit() for token in filter_ids):
+            raise Reject("Only ordered static filter numbers are supported.")
+        if not filter_ids and not negated:
+            raise Reject(
+                "Secure filter requires at least one filter number.", invalid=True
+            )
+        if any(not 1 <= int(value) <= 21474836 for value in filter_ids):
+            raise Reject(
+                "Static filter number is outside the documented range.", invalid=True
+            )
+        selected = {str(int(value)) for value in filter_ids}
+        matches = [
+            binding
+            for binding in self._bindings
+            if binding.target_name.casefold() == name.casefold()
+            and binding.direction == direction
+            and (not selected or binding.acl_name in selected)
+        ]
+        if negated:
+            if matches:
+                for binding in matches:
+                    self._bindings.remove(binding)
+            else:
+                self._missing(node)
+            self.parsed(node)
+            return
+        for position, filter_id in enumerate(filter_ids):
+            self._bindings.append(
+                ACLBinding(
+                    acl_name=str(int(filter_id)),
+                    target_type=target_type,
+                    target_name=name,
+                    direction=direction,
+                    source_reference=self.reference(node.line_number),
+                    attributes={
+                        "vendor": "Yamaha",
+                        "os_family": "RTX",
+                        "filter_order": position,
+                    },
+                )
+            )
+        self.parsed(node)
+
+    def _taint_acl(self, acl: ACL, node: ConfigNode, reason: str) -> None:
+        acl.complete = False
+        acl.incomplete_reasons.append(f"line {node.line_number}: {reason}")
+        acl.incomplete_source_references.append(self.reference(node.line_number))
 
     def _select(
         self, node: ConfigNode, kind: str, rest: list[str], negated: bool

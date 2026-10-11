@@ -207,3 +207,21 @@ No VRF, OSPF, BGP, ACL, STP, LAG, PoE, IPv6, LLDP or push support.
 
 Verification: synthetic fixtures only (`tests/config/yamaha_swx_*`), shaped
 after the command-reference examples; **no device verification**.
+
+## IPv4 ACL and static filter support
+
+This framework parses configuration; it does not evaluate packet matches or
+install policy. Shared models, source-reference behavior, tested syntax, and
+vendor-specific limitations are documented in [ACL support](acl-support.md).
+
+| Vendor / OS | Implemented ACL-like configuration | Evidence and limits |
+|---|---|---|
+| Cisco IOS / IOS XE | Numbered/named IPv4 standard and extended ACL definitions; interface `ip access-group in/out`; route-map `match ip address` references | IOS XE 17.x Security Configuration Guide and Cisco ACL examples consulted. Synthetic tests only; no device capture. See [ACL support](acl-support.md) for supported operators, incomplete-rule behavior, and unsupported forms |
+| Yamaha RTX | Static `ip filter` definitions and ordered `ip ... secure filter in/out` bindings | Yamaha RT command reference pages `ip_filter` and `ip_interface_secure_filter` consulted. Synthetic tests only; no device capture. Conditional `restrict`, dynamic filters, filter sets, lists/ranges, and unsupported address/port forms are retained as unsupported |
+| Yamaha SWX | No ACL syntax claimed | Reviewed SWX2320/SWX3200 material did not establish ACL grammar. Evidence gap only; not a device-capability claim |
+| FortiOS | No ACL translation | Stateful firewall policies are not represented as stateless ACL rules |
+| A10 ACOS | No ACL syntax claimed | CLI reference endpoint consulted requires authentication; ACL syntax was not verified |
+| HPE Comware | No ACL syntax claimed | Syntax was not verified for a specific target model/release |
+
+All ACL verification so far uses hand-written synthetic inputs, not real device
+captures. No device-output verification is claimed.

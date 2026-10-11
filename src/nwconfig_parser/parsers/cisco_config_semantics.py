@@ -14,8 +14,13 @@ from dataclasses import dataclass, field
 from ipaddress import AddressValueError, IPv4Address, IPv4Interface, IPv4Network
 
 from nwconfig_parser.models import (
+    ACL,
     VLAN,
     VRF,
+    ACLAddressCondition,
+    ACLBinding,
+    ACLPortCondition,
+    ACLRule,
     Banner,
     BGPNetwork,
     BGPPeer,
@@ -146,6 +151,7 @@ class _EntryBuilder:
     sets: list[str] = field(default_factory=list)
     prefix_lists: list[str] = field(default_factory=list)
     acls: list[str] = field(default_factory=list)
+    acl_reference_sources: list[SourceReference] = field(default_factory=list)
 
 
 class CiscoConfigInterpreter:
@@ -165,6 +171,9 @@ class CiscoConfigInterpreter:
         self._vrfs: OrderedDict[str, VRF] = OrderedDict()
         self._route_maps: OrderedDict[str, dict[int, _EntryBuilder]] = OrderedDict()
         self._route_map_state: dict[str, RouteMap] = {}
+        self._acls: OrderedDict[tuple[str, str], ACL] = OrderedDict()
+        self._acl_order: dict[tuple[str, str], int] = {}
+        self._acl_bindings: list[ACLBinding] = []
         self.parsed_count = 0
 
     # ------------------------------------------------------------------ utils
@@ -279,6 +288,9 @@ class CiscoConfigInterpreter:
         self.document.ospf_processes = list(self._ospf.values())
         if self._bgp is not None:
             self.document.bgp_processes = [self._bgp]
+        self.document.acls = list(self._acls.values())
+        self.document.acl_bindings = self._acl_bindings
+        self._finish_acls()
         self._finish_route_maps()
         self._build_references()
 
@@ -306,6 +318,10 @@ class CiscoConfigInterpreter:
             self._parsed(node)
         elif words[:2] == ["ip", "route"]:
             self._static_route(node, negated, tokens[2:])
+        elif words[:2] == ["ip", "access-list"]:
+            self._access_list(node, negated, tokens)
+        elif words[0] == "access-list":
+            self._numbered_access_list(node, negated, tokens)
         elif not negated and words[:2] == ["router", "ospf"]:
             self._ospf_block(node, tokens)
         elif not negated and words[:2] == ["router", "bgp"]:
@@ -384,6 +400,8 @@ class CiscoConfigInterpreter:
             self._interface_vrf(interface, node, negated, tokens)
         elif words[:2] == ["ip", "address"]:
             self._interface_ip(interface, negated, tokens[2:])
+        elif words[:2] == ["ip", "access-group"]:
+            self._interface_access_group(interface, node, negated, tokens)
         elif words == ["switchport"]:
             if negated:
                 interface.mode = "routed"
@@ -452,6 +470,374 @@ class CiscoConfigInterpreter:
                 interface.ipv4_addresses.insert(0, address)
         primaries = [a for a in interface.ipv4_addresses if a not in secondaries]
         interface.ipv4_address = primaries[0].ip if primaries else None
+
+    # --------------------------------------------------------------- IPv4 ACL
+    @staticmethod
+    def _numbered_acl_type(number: int) -> str | None:
+        if 1 <= number <= 99 or 1300 <= number <= 1999:
+            return "standard"
+        if 100 <= number <= 199 or 2000 <= number <= 2699:
+            return "extended"
+        return None
+
+    def _get_acl(self, name: str, acl_type: str) -> ACL:
+        key = (acl_type.casefold(), name.casefold())
+        acl = self._acls.get(key)
+        if acl is None:
+            acl = ACL(
+                name=name,
+                type=acl_type,
+                attributes={"vendor": "Cisco", "acl_scope": "global"},
+            )
+            self._acls[key] = acl
+            self._acl_order[key] = 0
+        return acl
+
+    def _access_list(
+        self, node: ConfigNode, negated: bool, tokens: list[str]
+    ) -> None:
+        if len(tokens) != 4 or tokens[2].casefold() not in {"standard", "extended"}:
+            raise _Reject("Unsupported ip access-list form.")
+        acl_type = tokens[2].casefold()
+        name = tokens[3]
+        key = (acl_type, name.casefold())
+        if negated:
+            if node.children:
+                raise _Reject("Negated ACL definition cannot contain entries.")
+            if self._acls.pop(key, None) is None:
+                self._info(
+                    node,
+                    "ACL_NOT_IN_PARSED_STATE",
+                    "ACL removal target is not present in the parsed input.",
+                )
+            self._acl_order.pop(key, None)
+            self._parsed(node)
+            return
+        acl = self._get_acl(name, acl_type)
+        if acl.source_reference is None:
+            acl.source_reference = self._reference(node.line_number)
+        self._parsed(node)
+        for child in node.children:
+            acl.entries.append(child.command)
+            try:
+                self._parse_acl_rule(acl, child)
+            except _Reject as rejection:
+                self._taint_acl(acl, child.line_number, "unparsed ACL entry")
+                self._reject(
+                    child,
+                    rejection.reason,
+                    invalid=rejection.invalid,
+                    parent=node,
+                )
+
+    def _numbered_access_list(
+        self, node: ConfigNode, negated: bool, tokens: list[str]
+    ) -> None:
+        if len(tokens) < 2 or not tokens[1].isdigit():
+            raise _Reject("ACL number is missing or invalid.", invalid=True)
+        number = int(tokens[1])
+        acl_type = self._numbered_acl_type(number)
+        if acl_type is None:
+            raise _Reject("ACL number is outside the supported IPv4 ranges.")
+        name = str(number)
+        key = (acl_type, name)
+        if negated:
+            if len(tokens) != 2 or node.children:
+                acl = self._acls.get(key)
+                if acl is not None:
+                    self._taint_acl(acl, node.line_number, "unsupported ACL removal form")
+                raise _Reject("Only whole numbered ACL removal is supported.")
+            if self._acls.pop(key, None) is None:
+                self._info(
+                    node,
+                    "ACL_NOT_IN_PARSED_STATE",
+                    "ACL removal target is not present in the parsed input.",
+                )
+            self._acl_order.pop(key, None)
+            self._parsed(node)
+            return
+        acl = self._get_acl(name, acl_type)
+        if acl.source_reference is None:
+            acl.source_reference = self._reference(node.line_number)
+        acl.entries.append(node.command)
+        try:
+            self._parse_acl_rule(acl, node, tokens=tokens[2:])
+        except _Reject as rejection:
+            self._taint_acl(acl, node.line_number, "unparsed ACL entry")
+            self._reject(node, rejection.reason, invalid=rejection.invalid)
+
+    def _parse_acl_rule(
+        self,
+        acl: ACL,
+        node: ConfigNode,
+        *,
+        tokens: list[str] | None = None,
+    ) -> None:
+        parts = node.command.split() if tokens is None else list(tokens)
+        if node.children or not parts:
+            raise _Reject("ACL entry is empty or nested.", invalid=True)
+        sequence: int | None = None
+        if parts[0].isdigit():
+            sequence = int(parts.pop(0))
+            if sequence < 1:
+                raise _Reject("ACL sequence must be positive.", invalid=True)
+        if not parts:
+            raise _Reject("ACL action is missing.", invalid=True)
+
+        order_key = (acl.type or "", acl.name.casefold())
+        input_order = self._acl_order[order_key]
+        self._acl_order[order_key] += 1
+        action = parts.pop(0).casefold()
+        reference = self._reference(node.line_number)
+        if action == "remark":
+            if not parts:
+                raise _Reject("ACL remark text is missing.", invalid=True)
+            rule = ACLRule(
+                input_order=input_order,
+                sequence=sequence,
+                remark=" ".join(parts),
+                source_reference=reference,
+            )
+        elif action in {"permit", "deny"}:
+            rule = self._parse_acl_match(
+                parts,
+                acl.type or "",
+                action,
+                input_order,
+                sequence,
+                reference,
+            )
+        else:
+            raise _Reject("ACL action is not supported.")
+        if sequence is not None and any(
+            existing.sequence == sequence for existing in acl.rules
+        ):
+            acl.complete = False
+            reason = f"duplicate explicit sequence at line {node.line_number}"
+            acl.incomplete_reasons.append(reason)
+            rule.complete = False
+            rule.incomplete_reasons.append(reason)
+            acl.rules.append(rule)
+            self._parsed(node)
+            self._reject(
+                node,
+                "Duplicate ACL sequence; evaluation order is ambiguous.",
+                code="DUPLICATE_ACL_SEQUENCE",
+            )
+            return
+        acl.rules.append(rule)
+        self._parsed(node)
+
+    def _parse_acl_match(
+        self,
+        parts: list[str],
+        acl_type: str,
+        action: str,
+        input_order: int,
+        sequence: int | None,
+        reference: SourceReference,
+    ) -> ACLRule:
+        if acl_type == "standard":
+            source, index = self._acl_address(parts, 0)
+            log: bool | None = None
+            if index < len(parts) and parts[index].casefold() == "log":
+                log = True
+                index += 1
+            if index != len(parts):
+                raise _Reject("Standard ACL options are not supported.")
+            return ACLRule(
+                input_order=input_order,
+                sequence=sequence,
+                action=action,
+                source=source,
+                log=log,
+                source_reference=reference,
+            )
+
+        if acl_type != "extended" or not parts:
+            raise _Reject("ACL type or protocol is not supported.")
+        protocol = parts[0].casefold()
+        if protocol not in {"ip", "tcp", "udp", "icmp"}:
+            raise _Reject("ACL protocol is not supported.")
+        source, index = self._acl_address(parts, 1)
+        source_port: ACLPortCondition | None = None
+        port_operators = {"eq", "neq", "lt", "gt", "range"}
+        if (
+            protocol in {"tcp", "udp"}
+            and index < len(parts)
+            and parts[index].casefold() in port_operators
+        ):
+            source_port, index = self._acl_port(parts, index)
+        destination, index = self._acl_address(parts, index)
+        destination_port: ACLPortCondition | None = None
+        if (
+            protocol in {"tcp", "udp"}
+            and index < len(parts)
+            and parts[index].casefold() in port_operators
+        ):
+            destination_port, index = self._acl_port(parts, index)
+        log = None
+        if index < len(parts) and parts[index].casefold() == "log":
+            log = True
+            index += 1
+        if index != len(parts):
+            raise _Reject("Extended ACL option is not supported.")
+        return ACLRule(
+            input_order=input_order,
+            sequence=sequence,
+            action=action,
+            protocol=protocol,
+            source=source,
+            destination=destination,
+            source_port=source_port,
+            destination_port=destination_port,
+            log=log,
+            source_reference=reference,
+        )
+
+    @staticmethod
+    def _acl_address(
+        parts: list[str], index: int
+    ) -> tuple[ACLAddressCondition, int]:
+        if index >= len(parts):
+            raise _Reject("ACL address condition is missing.", invalid=True)
+        token = parts[index].casefold()
+        if token == "any":
+            return ACLAddressCondition(kind="any"), index + 1
+        if token == "host":
+            if index + 1 >= len(parts):
+                raise _Reject("ACL host address is missing.", invalid=True)
+            try:
+                address = IPv4Address(parts[index + 1])
+            except AddressValueError as exc:
+                raise _Reject("ACL host address is invalid.", invalid=True) from exc
+            return ACLAddressCondition(kind="host", address=address), index + 2
+        try:
+            address = IPv4Address(parts[index])
+        except AddressValueError as exc:
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", parts[index]):
+                raise _Reject("ACL IPv4 address is invalid.", invalid=True) from exc
+            raise _Reject("ACL address form is not supported.") from exc
+        if index + 1 < len(parts):
+            try:
+                wildcard = IPv4Address(parts[index + 1])
+            except AddressValueError:
+                wildcard = None
+            if wildcard is not None:
+                return (
+                    ACLAddressCondition(
+                        kind="wildcard", address=address, wildcard_mask=wildcard
+                    ),
+                    index + 2,
+                )
+        return ACLAddressCondition(kind="host", address=address), index + 1
+
+    @staticmethod
+    def _acl_port(
+        parts: list[str], index: int
+    ) -> tuple[ACLPortCondition, int]:
+        if index >= len(parts):
+            raise _Reject("ACL port operator is missing.", invalid=True)
+        operator = parts[index].casefold()
+        if operator not in {"eq", "neq", "lt", "gt", "range"}:
+            raise _Reject("ACL port operator is not supported.")
+        required = 2 if operator == "range" else 1
+        if len(parts) < index + required + 1:
+            raise _Reject("ACL port value is missing.", invalid=True)
+        values = parts[index + 1 : index + required + 1]
+        if any(not value.isdigit() for value in values):
+            raise _Reject("Named ACL ports are not supported.")
+        numbers = [int(value) for value in values]
+        if any(value > 65535 for value in numbers):
+            raise _Reject("ACL port is outside the numeric range.", invalid=True)
+        if required == 2 and numbers[0] > numbers[1]:
+            raise _Reject("ACL port range is descending.", invalid=True)
+        return (
+            ACLPortCondition(
+                operator=operator,
+                first_port=numbers[0],
+                last_port=numbers[1] if required == 2 else None,
+            ),
+            index + required + 1,
+        )
+
+    def _taint_acl(self, acl: ACL, line: int, reason: str) -> None:
+        acl.complete = False
+        acl.incomplete_reasons.append(f"line {line}: {reason}")
+        acl.incomplete_source_references.append(self._reference(line))
+
+    def _finish_acls(self) -> None:
+        same_name: dict[str, list[ACL]] = {}
+        for acl in self.document.acls:
+            same_name.setdefault(acl.name.casefold(), []).append(acl)
+        for candidates in same_name.values():
+            if len(candidates) > 1:
+                for acl in candidates:
+                    acl.complete = False
+                    acl.incomplete_reasons.append(
+                        "the same ACL identifier exists in multiple ACL types"
+                    )
+        for acl in self.document.acls:
+            if not acl.rules:
+                continue
+            explicit = [rule.sequence is not None for rule in acl.rules]
+            sequences = [rule.sequence for rule in acl.rules]
+            if all(explicit) and len(set(sequences)) == len(sequences):
+                acl.rules.sort(key=lambda rule: rule.sequence or 0)
+            elif any(explicit) and not all(explicit):
+                acl.complete = False
+                acl.incomplete_reasons.append(
+                    "mixed explicit and implicit sequence; declaration order retained"
+                )
+
+    def _interface_access_group(
+        self,
+        interface: Interface,
+        node: ConfigNode,
+        negated: bool,
+        tokens: list[str],
+    ) -> None:
+        if len(tokens) != 4 or tokens[3].casefold() not in {"in", "out"}:
+            raise _Reject("Only IPv4 interface access-group in/out is supported.")
+        name, direction = tokens[2], tokens[3].casefold()
+        existing = [
+            binding
+            for binding in self._acl_bindings
+            if binding.target_type == "interface"
+            and binding.target_name.casefold() == interface.name.casefold()
+            and binding.acl_name.casefold() == name.casefold()
+            and binding.direction == direction
+        ]
+        if negated:
+            if existing:
+                self._acl_bindings.remove(existing[-1])
+            else:
+                self._info(
+                    node,
+                    "ACL_BINDING_NOT_IN_PARSED_STATE",
+                    "ACL binding removal target is not present in parsed input.",
+                )
+        else:
+            if any(
+                binding.target_type == "interface"
+                and binding.target_name.casefold() == interface.name.casefold()
+                and binding.direction == direction
+                for binding in self._acl_bindings
+            ):
+                raise _Reject(
+                    "Multiple ACL bindings for one interface direction are ambiguous."
+                )
+            self._acl_bindings.append(
+                ACLBinding(
+                    acl_name=name,
+                    target_type="interface",
+                    target_name=interface.name,
+                    direction=direction,
+                    source_reference=self._reference(node.line_number),
+                    attributes={"vendor": "Cisco", "acl_scope": "global"},
+                )
+            )
+        self._parsed(node)
 
     @staticmethod
     def _trunk_allowed(trunk: _TrunkState, negated: bool, args: list[str]) -> None:
@@ -1313,6 +1699,9 @@ class CiscoConfigInterpreter:
                 builder.prefix_lists.extend(tokens[4:])
             else:
                 builder.acls.extend(tokens[3:])
+                builder.acl_reference_sources.extend(
+                    self._reference(node.line_number) for _ in tokens[3:]
+                )
             builder.matches.append(node.command)
         elif words[:2] == ["set", "local-preference"] and len(tokens) == 3:
             _integer(tokens[2], 0, 4294967295, "local-preference")
@@ -1355,6 +1744,9 @@ class CiscoConfigInterpreter:
                         prefix_list_references=tuple(builder.prefix_lists),
                         acl_references=tuple(builder.acls),
                         source_reference=builder.reference,
+                        acl_reference_sources=tuple(
+                            builder.acl_reference_sources
+                        ),
                     )
                 )
             maps.append(route_map)
@@ -1403,13 +1795,23 @@ class CiscoConfigInterpreter:
         prefix_names = {p.name for p in self.document.prefix_lists}
         map_names = {m.name for m in self.document.route_maps}
         references: list[ConfigReference] = []
+        for binding in self.document.acl_bindings:
+            resolved, reason = self._resolve_acl_reference(binding.acl_name)
+            binding_reference = binding.source_reference
+            references.append(
+                ConfigReference(
+                    "interface",
+                    binding.target_name,
+                    f"access-group-{binding.direction}",
+                    "acl",
+                    binding.acl_name,
+                    binding_reference.start_line if binding_reference else None,
+                    resolved,
+                    resolution_reason=reason,
+                )
+            )
         for route_map in self.document.route_maps:
             for entry in route_map.entries:
-                line = (
-                    entry.source_reference.start_line
-                    if entry.source_reference
-                    else None
-                )
                 for target in entry.prefix_list_references:
                     references.append(
                         ConfigReference(
@@ -1418,12 +1820,22 @@ class CiscoConfigInterpreter:
                             "match-prefix-list",
                             "prefix-list",
                             target,
-                            line,
+                            (
+                                entry.source_reference.start_line
+                                if entry.source_reference
+                                else None
+                            ),
                             target in prefix_names,
                             entry.sequence,
                         )
                     )
-                for target in entry.acl_references:
+                for index, target in enumerate(entry.acl_references):
+                    source = (
+                        entry.acl_reference_sources[index]
+                        if index < len(entry.acl_reference_sources)
+                        else entry.source_reference
+                    )
+                    resolved, reason = self._resolve_acl_reference(target)
                     references.append(
                         ConfigReference(
                             "route-map",
@@ -1431,9 +1843,10 @@ class CiscoConfigInterpreter:
                             "match-acl",
                             "acl",
                             target,
-                            line,
-                            None,
+                            source.start_line if source else None,
+                            resolved,
                             entry.sequence,
+                            reason,
                         )
                     )
         for bgp in self.document.bgp_processes:
@@ -1479,31 +1892,66 @@ class CiscoConfigInterpreter:
                             )
                         )
         references.extend(self._vrf_references())
-        for reference in references:
-            if reference.resolved is False:
+        for config_reference in references:
+            if config_reference.resolved is False:
                 self.issues.append(
                     ParseIssue(
                         severity=IssueSeverity.INFO,
                         code=(
                             "VRF_DEFINITION_NOT_IN_INPUT"
-                            if reference.target_type == "vrf"
+                            if config_reference.target_type == "vrf"
                             else "DANGLING_REFERENCE"
                         ),
                         message=(
-                            f"{reference.source_type} {reference.source_name} "
-                            f"references undefined {reference.target_type} "
-                            f"{reference.target_name!r} (it may be defined in "
-                            "unparsed or external configuration)."
+                            "A referenced VRF is not defined in the input."
+                            if config_reference.target_type == "vrf"
+                            else (
+                                "ACL reference target is not defined in the parsed "
+                                "configuration."
+                                if config_reference.target_type == "acl"
+                                else (
+                                    f"{config_reference.source_type} "
+                                    f"{config_reference.source_name} references "
+                                    f"undefined {config_reference.target_type} "
+                                    f"{config_reference.target_name!r} (it may be "
+                                    "defined in unparsed or external configuration)."
+                                )
+                            )
                         ),
-                        line_number=reference.line_number,
+                        line_number=config_reference.line_number,
                         source_reference=(
-                            self._reference(reference.line_number)
-                            if reference.line_number
+                            self._reference(config_reference.line_number)
+                            if config_reference.line_number
+                            else None
+                        ),
+                    )
+                )
+            elif (
+                config_reference.resolved is None
+                and config_reference.target_type == "acl"
+            ):
+                self.issues.append(
+                    ParseIssue(
+                        severity=IssueSeverity.INFO,
+                        code="AMBIGUOUS_REFERENCE",
+                        message="ACL reference cannot be resolved unambiguously.",
+                        line_number=config_reference.line_number,
+                        source_reference=(
+                            self._reference(config_reference.line_number)
+                            if config_reference.line_number
                             else None
                         ),
                     )
                 )
         self.document.references = references
+
+    def _resolve_acl_reference(self, name: str) -> tuple[bool | None, str | None]:
+        matches = [acl for acl in self.document.acls if acl.name.casefold() == name.casefold()]
+        if not matches:
+            return False, "No matching ACL definition was parsed."
+        if len(matches) > 1:
+            return None, "The identifier matches multiple ACL types."
+        return True, None
 
 
 def _walk(node: ConfigNode) -> list[ConfigNode]:
